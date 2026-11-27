@@ -16,7 +16,21 @@ representation:
 The core is render-agnostic, has no GPU, async-runtime or engine dependency,
 and compiles to `wasm32-unknown-unknown`.
 
-Status: design phase, nothing implemented yet.
+Status: the sparse core (`crates/voxelle`): a root map over two levels of
+internal nodes and 8³ leaf bricks, accessors with a path cache, iteration
+over active values, prune. See [`docs/00-design.md`](docs/00-design.md).
+Tiles, time, levels of detail and the GPU layout are not there yet.
+
+## Tests
+
+Tests run on a remote BuildKit builder, not on the development machine:
+
+```bash
+VOXELLE_BUILDER=<buildx builder> scripts/test-on-builder.sh
+```
+
+CI (`.github/workflows/ci.yml`) runs the same steps: fmt, tests, clippy and
+the `wasm32-unknown-unknown` check of the core.
 
 ## License
 
