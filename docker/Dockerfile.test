@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1.10
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+#
+# The test suite of the workspace, run inside a BuildKit build, for a machine
+# that can build images but must not compile the workspace itself. The result
+# is a directory of logs, not an image. Do not build this by hand:
+# scripts/test-on-builder.sh makes the context and passes the arguments.
+#
+# The steps (TEST_STEPS, space-separated; every step runs past a failure):
+#   fmt     cargo fmt --all --check
+#   test    cargo test ${CARGO_TEST_ARGS} (unit, integration and doc tests)
+#   clippy  cargo clippy --workspace --all-targets -- -D warnings
+#   wasm    cargo check and clippy of the core for wasm32-unknown-unknown
+# then each line of .test-on-builder/commands, as cmd-1, cmd-2…
+#
+# The output: <step>.log and <step>.exit per step, summary.txt,
+# changes.patch (what the steps changed in the tree, e.g. Cargo.lock) and
+# exit-code (0, or the first failing step's code).
+
+FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS base
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       ca-certificates curl git build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust pinned to a stable of the day, so the layer is not a stale `stable`.
+ARG RUSTUP_VERSION=1.29.3
+ARG RUSTUP_SHA256=b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
+ARG RUST_VERSION=1.100.0
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL -o /tmp/rustup-init \
+       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    && echo "${RUSTUP_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+    && chmod +x /tmp/rustup-init \
+    && /tmp/rustup-init -y --no-modify-path --profile minimal \
+       --default-toolchain "${RUST_VERSION}" \
+       --component clippy --component rustfmt --target wasm32-unknown-unknown \
+    && rm /tmp/rustup-init \
+    && rustc --version
+
+ENV CARGO_HOME=/cargo-home CARGO_TERM_COLOR=never CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    RUSTFLAGS="-D warnings" CARGO_PROFILE_DEV_DEBUG=line-tables-only
+
+FROM base AS test
+WORKDIR /repo
+COPY . .
+
+ARG TARGET_SLOT=0
+ARG CARGO_TEST_ARGS="--workspace"
+ARG TEST_STEPS="fmt test clippy wasm"
+ARG CARGO_JOBS=4
+ARG TEST_THREADS=4
+RUN --mount=type=cache,id=voxelle-test-target-${TARGET_SLOT},target=/repo/target \
+    --mount=type=cache,id=voxelle-cargo-home,target=/cargo-home \
+    <<'EOF'
+#!/bin/bash
+set -u
+mkdir -p /out
+export CARGO_BUILD_JOBS="${CARGO_JOBS}" RUST_TEST_THREADS="${TEST_THREADS}"
+echo "=== $(rustc --version)"
+if [ -f .test-on-builder/commands ]; then mv .test-on-builder/commands /tmp/commands; fi
+rm -rf .test-on-builder
+# The tree is newer than anything in the shared target cache: `git archive`
+# dates files by their commit, and a commit older than the cache's last build
+# would look fresh to cargo. Touched here, inside the run that mounts it.
+find /repo -path /repo/target -prune -o -type f -print0 | xargs -0 touch
+snap() { git --git-dir=/tmp/tree.git --work-tree=/repo -c core.autocrlf=false "$@"; }
+snap init -q && snap add -A && snap -c user.name=t -c user.email=t@t commit -qm tree \
+    || echo "=== no snapshot of the tree: changes.patch will be missing"
+first_rc=0
+step() { # $1=name, then the commands, run by bash -c
+    local name="$1" rc
+    shift
+    echo "=== ${name}: start $(date +%T)" | tee "/out/${name}.log"
+    bash -c "$*" < /dev/null 2>&1 | tee -a "/out/${name}.log" | sed -u "s/^/|${name}| /"
+    rc=${PIPESTATUS[0]}
+    echo "$rc" > "/out/${name}.exit"
+    echo "=== ${name}: exit ${rc} $(date +%T)" | tee -a "/out/${name}.log" | tee -a /out/summary.txt
+    grep -E "^test result|^error(\[E[0-9]+\])?:|panicked|FAILED|^MUTATION" "/out/${name}.log" \
+        | sort | uniq -c | sort -rn | sed -n 1,30p | sed "s/^/[${name}] /" | tee -a /out/summary.txt
+    [ "$first_rc" -ne 0 ] || first_rc=$rc
+}
+for s in ${TEST_STEPS}; do
+    case "$s" in
+        fmt)    step fmt "cargo fmt --all --check" ;;
+        test)   step test "cargo test ${CARGO_TEST_ARGS}" ;;
+        clippy) step clippy "cargo clippy --workspace --all-targets -- -D warnings" ;;
+        wasm)   step wasm "cargo check --target wasm32-unknown-unknown -p voxelle \
+                    && cargo clippy --target wasm32-unknown-unknown -p voxelle -- -D warnings" ;;
+        *)
+            echo "=== unknown step '${s}'" | tee -a /out/summary.txt
+            [ "$first_rc" -ne 0 ] || first_rc=2 ;;
+    esac
+done
+if [ -f /tmp/commands ]; then
+    n=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        n=$((n + 1))
+        echo "cmd-${n}: ${line}" >> /out/commands.txt
+        step "cmd-${n}" "$line"
+    done < /tmp/commands
+fi
+snap add -A 2>/dev/null && snap diff --cached --binary > /out/changes.patch 2>/dev/null
+echo "=== changes: $(snap diff --cached --stat 2>/dev/null | tail -n1)" | tee -a /out/summary.txt
+echo "$first_rc" > /out/exit-code
+echo "=== tests: exit ${first_rc} $(date +%T)"
+EOF
+
+FROM scratch
+COPY --from=test /out /

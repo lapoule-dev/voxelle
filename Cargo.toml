@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+# Copyright (c) lapoule.dev
+
+[workspace]
+resolver = "3"
+members = ["crates/voxelle"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lapoule-dev/voxelle"
+authors = ["lapoule.dev"]
+
+[workspace.dependencies]
+proptest = "1"
